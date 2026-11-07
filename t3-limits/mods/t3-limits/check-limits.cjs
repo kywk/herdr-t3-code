@@ -190,6 +190,51 @@ test("Antigravity: summary buckets by family, untouched resets dropped; models a
   assert.deepEqual(fns.mostUsed([[{ id: "a", used: 10 }], [{ id: "a", used: 30 }]]).map((w) => w.used), [30]);
 });
 
+const AG_SUMMARY = { groups: [{ displayName: "Pro", buckets: [
+  { bucketId: "gemini-pro-weekly", window: "weekly", remainingFraction: 0.6, resetTime: "2026-11-07T00:00:00Z" },
+] }] };
+
+test("Antigravity CLI: Keychain login is read when there is no ACP file", async () => {
+  const ACCESS = "ya29.cli-fake";
+  const m = machine({
+    found: ["antigravity"],
+    programs: { "find-generic-password": { stdout: `${ACCESS}\n` } },
+    web: (url) => url.endsWith(":retrieveUserQuotaSummary") ? { status: 200, body: AG_SUMMARY } : { status: 404 },
+  });
+  await m.start();
+  assert.deepEqual(m.rows(), ["antigravity"]);
+  assert.ok(texts(find(m.tree, "limits-antigravity")).includes("40%"));
+  for (const f of m.fetches) {
+    const host = new URL(f.url).host;
+    assert.ok(["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"].includes(host), `CLI token went to ${host}`);
+  }
+  const kept = JSON.stringify([...m.store.entries()]) + JSON.stringify(m.mod.state) + texts(m.render()).join("");
+  assert.ok(!kept.includes(ACCESS), "CLI access token leaked into storage or rows");
+});
+
+test("Antigravity CLI: an expired Keychain token refreshes through agy once", async () => {
+  let n = 0;
+  const m = machine({
+    found: ["antigravity"],
+    programs: { "find-generic-password": { stdout: "ya29.cli-old\n" }, "agy models": { stdout: "" } },
+    web: (url) => {
+      if (!url.endsWith(":retrieveUserQuotaSummary")) return { status: 404 };
+      n += 1;
+      return n <= 2 ? { status: 401 } : { status: 200, body: AG_SUMMARY };
+    },
+  });
+  await m.start();
+  assert.deepEqual(m.rows(), ["antigravity"]);
+  assert.ok(m.execs.some((e) => e[0] === "agy" && e[1] === "models"), "agy refreshes its own login");
+  assert.equal(m.execs.filter((e) => e.join(" ").includes("find-generic-password")).length, 2, "Keychain re-read after refresh");
+});
+
+test("Antigravity CLI: no Keychain login means no row", async () => {
+  const m = machine({ found: ["antigravity"] });
+  await m.start();
+  assert.deepEqual(m.rows(), []);
+});
+
 test("Grok Build: one subscription window for its period; a missing percent with a full period is 0", () => {
   const period = { type: "USAGE_PERIOD_TYPE_WEEKLY", start: "2026-11-01T00:00:00Z", end: "2026-11-08T00:00:00Z" };
   assert.deepEqual(fns.grokWindows({ config: { creditUsagePercent: 64, currentPeriod: period } }).map((w) => [w.label, w.used, w.resetsAt]),

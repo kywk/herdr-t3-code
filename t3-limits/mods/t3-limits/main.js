@@ -244,7 +244,7 @@ const DETECT = [
   '[ -f "$HOME/.grok/auth.json" ] && echo grok',
   '[ -d "${CODEX_HOME:-$HOME/.codex}/sessions" ] && echo codex',
   '[ -d "${XDG_DATA_HOME:-$HOME/.local/share}/opencode" ] && echo opencode',
-  '{ [ -d "$HOME/.gemini/antigravity" ] || [ -f "$HOME/.gemini/antigravity-acp/acp_token.json" ]; } && echo antigravity',
+  '{ [ -d "$HOME/.gemini/antigravity" ] || [ -f "$HOME/.gemini/antigravity-acp/acp_token.json" ] || command -v agy >/dev/null 2>&1; } && echo antigravity',
   "true",
 ].join("\n");
 async function detect() {
@@ -355,11 +355,55 @@ async function readOpencode() {
   return null;
 }
 
-// Antigravity's ACP login (GEMINI_HOME's file storage): a fresh access token each read, held only for that read.
+// Antigravity's ACP login (GEMINI_HOME's file storage), or the agy CLI's own login
+// (macOS Keychain's gemini/antigravity entry): a fresh access token each read, held only for that read.
 const QUOTA_HOSTS = ["https://daily-cloudcode-pa.googleapis.com", "https://cloudcode-pa.googleapis.com"];
+// The Keychain holds a go-keyring-base64 OAuth token. The shell prints only its
+// access token, so the refresh token never leaves the Keychain.
+const AGY_KEYCHAIN = [
+  "out=$(security find-generic-password -s gemini -a antigravity -w 2>/dev/null) || exit 1",
+  "printf '%s' \"$out\" | sed 's/^go-keyring-base64://' | python3 -c 'import json,sys,base64; print(json.loads(base64.b64decode(sys.stdin.read().strip())).get(\"token\",{}).get(\"access_token\",\"\"))'",
+].join("\n");
+async function agyAccessToken() {
+  const r = await exec("sh", ["-c", AGY_KEYCHAIN]).catch(() => null);
+  const t = (r?.stdout ?? "").trim();
+  return t || null;
+}
+// One quota read against both hosts, keeping each window's most-used reading.
+async function antigravityAsk(access, project, op, parse) {
+  const at = Date.now();
+  const out = await Promise.all(QUOTA_HOSTS.map(async (host) => {
+    const r = await fetch(`${host}/v1internal:${op}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json", "User-Agent": "antigravity/hub/2.24.0 (aidev_client)" },
+      body: JSON.stringify(project ? { project } : {}),
+    }).catch(() => null);
+    return r?.ok ? parse(await r.json(), at) : [];
+  }));
+  return mostUsed(out);
+}
+async function antigravityWindows(access, project) {
+  const windows = await antigravityAsk(access, project, "retrieveUserQuotaSummary", antigravitySummary);
+  return windows.length ? windows : antigravityAsk(access, project, "fetchAvailableModels", antigravityModels);
+}
+// The agy CLI path: no prompt reaches a model. On empty windows the token may have
+// expired, so `agy models` runs once to let the CLI refresh its own login, then the
+// Keychain is read again. Nothing is kept past the read.
+async function readAntigravityCli() {
+  let access = await agyAccessToken();
+  if (!access) return null;
+  let windows = await antigravityWindows(access, null);
+  if (!windows.length) {
+    await exec("agy", ["models"], { timeout: 15000 }).catch(() => null);
+    access = await agyAccessToken();
+    if (access) windows = await antigravityWindows(access, null);
+  }
+  if (!windows.length) throw new Error("Antigravity returned no quota");
+  return windows;
+}
 async function readAntigravity() {
   const text = await readTextFile(`${home()}/.gemini/antigravity-acp/acp_token.json`).catch(() => null);
-  if (!text) return null;
+  if (!text) return readAntigravityCli();
   const tok = JSON.parse(text);
   if (![tok.client_id, tok.client_secret, tok.refresh_token].every((s) => typeof s === "string" && s)) return null;
   const form = { client_id: tok.client_id, client_secret: tok.client_secret, refresh_token: tok.refresh_token, grant_type: "refresh_token" };
@@ -369,17 +413,7 @@ async function readAntigravity() {
   });
   const access = t.ok ? (await t.json())?.access_token : null;
   if (typeof access !== "string" || !access) throw new Error("Google refused the Antigravity login");
-  const ask = (op, parse) => Promise.all(QUOTA_HOSTS.map(async (host) => {
-    const at = Date.now();
-    const r = await fetch(`${host}/v1internal:${op}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json", "User-Agent": "antigravity/hub/2.24.0 (aidev_client)" },
-      body: JSON.stringify(tok.project_id ? { project: tok.project_id } : {}),
-    }).catch(() => null);
-    return r?.ok ? parse(await r.json(), at) : [];
-  })).then(mostUsed);
-  const windows = await ask("retrieveUserQuotaSummary", antigravitySummary);
-  const found = windows.length ? windows : await ask("fetchAvailableModels", antigravityModels);
+  const found = await antigravityWindows(access, tok.project_id);
   if (!found.length) throw new Error("Antigravity returned no quota");
   return found;
 }
