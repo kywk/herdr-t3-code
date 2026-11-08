@@ -15,7 +15,8 @@ function element() {
       else if (["child", "content", "trigger"].includes(key)) node.items.push(args[0]);
       else if (key === "children") node.items.push(...args[0]);
       else if (key === "id") node.key = args[0];
-      else if (key.startsWith("on_")) node.handlers[key] = args[0];
+      // on_mouse_down/up take (button, handler); everything else takes the handler first.
+      else if (key.startsWith("on_")) node.handlers[key] = (key === "on_mouse_down" || key === "on_mouse_up") && typeof args[0] === "string" ? args[1] : args[0];
       else node.style[key] = args;
       return proxy;
     };
@@ -42,9 +43,12 @@ const APP = `${HOME}/.config/herdr-app`;
 
 // A fake machine: `files` by path, `programs` answer exec by the script they're given, `web` answers fetch.
 function machine({ found = [], files = {}, programs = {}, web = () => ({ status: 404 }), node = "limits", accounts = null, launcher = true } = {}) {
-  const m = { now: NOW, store: new Map(), runs: [], fetches: [], execs: [], jobs: [], shared: { "limits.accounts": accounts }, overlays: [], input: "", waiters: [] };
+  const m = { now: NOW, store: new Map(), runs: [], fetches: [], execs: [], jobs: [], shared: { "limits.accounts": accounts }, overlays: [], input: "", waiters: [], winpos: { x: 0, y: 0 } };
   const env = {
     View: class {}, div: element, svg: element, image: element, v_flex: element, h_flex: element,
+    window: { paint_path: () => element(), mouse_position: () => { if (m.winpos.dead) throw new Error("no live host"); return { x: m.winpos.x, y: m.winpos.y }; } },
+    PathBuilder: { fill: () => element() },
+    Background: { linear_gradient: () => ({}) },
     Popover: { new: (id) => element().id(id) }, Input: { new: element },
     InputState: { new: () => ({ on() {}, value: () => m.input, set_value(v) { m.input = v; }, focus() {} }) },
     appHome: () => APP, focused: () => ({ space: "s1" }),
@@ -203,7 +207,7 @@ test("Antigravity CLI: Keychain login is read when there is no ACP file", async 
   });
   await m.start();
   assert.deepEqual(m.rows(), ["antigravity"]);
-  assert.ok(texts(find(m.tree, "limits-antigravity")).includes("40%"));
+  assert.ok(texts(find(m.tree, "limits-antigravity")).includes("60%"), "what's left, not what's used");
   for (const f of m.fetches) {
     const host = new URL(f.url).host;
     assert.ok(["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"].includes(host), `CLI token went to ${host}`);
@@ -279,8 +283,8 @@ test("rows: real numbers for Claude and Codex; a provider with no window has no 
   await m.start();
   assert.deepEqual(m.rows(), ["codex", "claude"], "T3's order; OpenCode without a Go key has no row");
   const claude = texts(find(m.tree, "limits-claude"));
-  assert.ok(claude.includes("71%") && claude.includes("1d 18h"), claude.join("|"));
-  assert.ok(texts(find(m.tree, "limits-codex")).includes("1%"));
+  assert.ok(claude.includes("29%") && claude.includes("1d 18h"), claude.join("|"));
+  assert.ok(texts(find(m.tree, "limits-codex")).includes("99%"));
   assert.equal(m.fetches.length, 0, "OpenRouter's key is not OpenCode Go's: nothing is sent");
   // The card lists every window with its exact reset.
   const card = texts(find(m.tree, "limits-card-claude")).join("|");
@@ -310,7 +314,7 @@ test("folding keeps one summary line and is remembered", async () => {
   find(m.tree, "limits-head").handlers.on_click({}, m.cx);
   assert.equal(m.store.get("collapsed"), "true");
   assert.deepEqual(m.rows(), []);
-  assert.ok(texts(find(m.tree, "limits-head")).includes("71%"));
+  assert.ok(texts(find(m.tree, "limits-head")).includes("29%"), "the folded heading shows what's left");
   assert.deepEqual(plain(m.runs.at(-1)), ["layout.resize", { id: "limits", px: 28 }]);
   const again = machine({ found: ["claude"] });
   again.store.set("collapsed", "true");
@@ -318,7 +322,7 @@ test("folding keeps one summary line and is remembered", async () => {
   assert.equal(again.mod.collapsed, true);
 });
 
-test("a failed read keeps the last good windows, backs off, and a top bar doesn't resize", async () => {
+test("a failed read keeps the last good windows, backs off, and a status bar doesn't resize", async () => {
   const m = machine({ found: ["codex"], node: null, programs: { "account/rateLimits/read": { stdout: JSON.stringify({ id: 2, result: CODEX_RESULT }) } } });
   await m.start();
   const cached = JSON.parse(m.store.get("cache"));
@@ -331,8 +335,229 @@ test("a failed read keeps the last good windows, backs off, and a top bar doesn'
   assert.equal(s.windows[0].used, 1);
   assert.equal(s.failures, 1);
   assert.equal(s.nextAt, NOW + 10 * 60000);
-  assert.ok(texts(m.render()).includes("1%"));
+  assert.ok(texts(m.render()).includes("99%"), "the bar shows what's left");
   assert.equal(m.runs.length, 0);
+});
+
+test("the status bar shows what's left per provider and opens every provider together", async () => {
+  const m = machine({ found: ["claude", "codex"], node: null, programs: BOTH });
+  await m.start();
+  m.render();
+  // One icon and what's left per provider, in T3's order.
+  assert.deepEqual(plain(ids(m.tree)).filter((k) => k.startsWith("limits-seg-")), ["limits-seg-codex", "limits-seg-claude"]);
+  const bar = texts(find(m.tree, "limits-bar")).join("|");
+  assert.ok(bar.includes("99%") && bar.includes("29%"), bar);
+  assert.ok(!bar.includes("1d 18h"), "resets stay in the card");
+  assert.equal(m.runs.length, 0, "the status bar never resizes");
+  // A click opens one card holding every provider together.
+  find(m.tree, "limits-pop").handlers.on_open_change(true, m.cx);
+  await m.settle();
+  assert.equal(find(m.render(), "limits-pop").style.open[0], true);
+  const card = find(m.tree, "limits-card");
+  assert.deepEqual(plain(ids(card)).filter((k) => k.startsWith("limits-section-")), ["limits-section-codex", "limits-section-claude"]);
+  assert.match(texts(card).join("|"), /Weekly · Fable/);
+  // Closing, and the same-press reopen guard.
+  find(m.tree, "limits-pop").handlers.on_open_change(false, m.cx);
+  assert.equal(find(m.render(), "limits-pop").style.open[0], false);
+  find(m.tree, "limits-pop").handlers.on_open_change(true, m.cx);
+  assert.equal(find(m.render(), "limits-pop").style.open[0], false);
+});
+
+test("plan badges show the subscription where the API reports one", async () => {
+  const usage = JSON.parse(JSON.stringify(CLAUDE_USAGE));
+  usage.subscription_type = "pro";
+  const m = machine({
+    found: ["claude", "codex", "grok", "cursor"],
+    programs: {
+      "get_usage": { stdout: claudeStdout(usage) },
+      "account/rateLimits/read": { stdout: JSON.stringify({ id: 2, result: { rateLimits: { limitId: "codex", planType: "plus", primary: { usedPercent: 40, windowDurationMins: 300, resetsAt: 1793844431 } } } }) },
+    },
+    files: {
+      [`${HOME}/.grok/auth.json`]: JSON.stringify({ "https://accounts.x.ai/sign-in": { key: "xai-fake-plan" } }),
+      [`${HOME}/.cursor/auth.json`]: JSON.stringify({ accessToken: "cursor-fake-plan" }),
+    },
+    web: (url) => url.endsWith("GetPlanInfo") ? { status: 200, body: { planInfo: { planName: "Starship" } } }
+      : url.endsWith("GetCurrentPeriodUsage") ? { status: 200, body: { billingCycleEnd: 1795000000000, planUsage: { totalPercentUsed: 50 } } }
+      : url.startsWith("https://cli-chat-proxy.grok.com/") ? { status: 200, body: { subscriptionTier: "SuperGrok Heavy", config: { creditUsagePercent: 20, currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY", end: "2026-12-01T00:00:00Z" } } } }
+      : { status: 404 },
+  });
+  await m.start();
+  m.render();
+  assert.equal(texts(find(m.tree, "limits-badge-claude")).join(""), "PRO");
+  assert.equal(texts(find(m.tree, "limits-badge-codex")).join(""), "PLUS");
+  assert.equal(texts(find(m.tree, "limits-badge-grok")).join(""), "SuperGrok Heavy");
+  assert.equal(texts(find(m.tree, "limits-badge-cursor")).join(""), "Starship");
+  assert.equal(m.mod.state.claude.plan, "PRO");
+  assert.equal(m.mod.state.codex.plan, "PLUS");
+});
+
+test("providers without a reported plan get no badge", async () => {
+  const m = machine({
+    found: ["antigravity", "opencode"],
+    programs: { "find-generic-password": { stdout: "ya29.cli-fake\n" } },
+    files: { [`${HOME}/.local/share/opencode/auth.json`]: JSON.stringify({ "opencode-go": { type: "api", key: "sk-go-fake-plan" } }) },
+    web: (url) => url.endsWith(":retrieveUserQuotaSummary") ? { status: 200, body: AG_SUMMARY }
+      : url.startsWith("https://opencode.ai/") ? { status: 200, body: { usage: { monthly: { percent: 7, resetsAt: "2026-12-01T00:00:00Z" } } } }
+      : { status: 404 },
+  });
+  await m.start();
+  m.render();
+  assert.deepEqual(m.rows(), ["opencode", "antigravity"]);
+  assert.equal(find(m.tree, "limits-badge-antigravity"), null);
+  assert.equal(find(m.tree, "limits-badge-opencode"), null);
+});
+
+test("the unified card shows rings, plans, refills and when it was read", async () => {
+  const usage = JSON.parse(JSON.stringify(CLAUDE_USAGE));
+  usage.subscription_type = "max";
+  const m = machine({ found: ["claude"], node: null, programs: { "get_usage": { stdout: claudeStdout(usage) } } });
+  await m.start();
+  m.render();
+  find(m.tree, "limits-pop").handlers.on_open_change(true, m.cx);
+  await m.settle();
+  m.render();
+  assert.ok(find(m.tree, "limits-ring-claude"), "the ring");
+  assert.ok(texts(find(m.tree, "limits-ring-claude")).includes("29%"), "the ring number is what's left");
+  assert.equal(texts(find(m.tree, "limits-badge-claude")).join(""), "MAX");
+  assert.ok(find(m.tree, "limits-cards"), "the scrolling list");
+  const card = texts(find(m.tree, "limits-card")).join("|");
+  assert.ok(card.includes("refills"), "the refills time");
+  assert.ok(card.includes("Updated"), "the footer");
+  // The refresh button reads everything again.
+  m.now += 1000;
+  find(m.tree, "limits-refresh").handlers.on_click({}, m.cx);
+  await m.settle();
+  assert.ok(m.mod.state.claude.checkedAt > NOW, "a manual read");
+});
+
+test("settings: provider order and the strip count persist on this machine", async () => {
+  const m = machine({ found: ["claude", "codex"], node: null, programs: BOTH });
+  await m.start();
+  m.render();
+  assert.deepEqual(plain(m.mod.order).slice(0, 2), ["codex", "claude"]);
+  assert.deepEqual(plain(ids(m.tree)).filter((k) => k.startsWith("limits-seg-")), ["limits-seg-codex", "limits-seg-claude"]);
+  // Move Claude above Codex: the strip follows.
+  m.mod.move("claude", -1, m.cx);
+  assert.deepEqual(plain(m.mod.order).slice(0, 2), ["claude", "codex"]);
+  assert.deepEqual(JSON.parse(m.store.get("order")).slice(0, 2), ["claude", "codex"]);
+  assert.deepEqual(plain(ids(m.render())).filter((k) => k.startsWith("limits-seg-")), ["limits-seg-claude", "limits-seg-codex"]);
+  // The strip shows up to the chosen count; the card keeps every provider.
+  m.mod.setMax(1, m.cx);
+  assert.equal(m.mod.maxItems, 1);
+  assert.equal(m.store.get("maxItems"), "1");
+  assert.deepEqual(plain(ids(m.render())).filter((k) => k.startsWith("limits-seg-")), ["limits-seg-claude"]);
+  m.mod.setMax(99, m.cx);
+  assert.deepEqual(plain(ids(m.render())).filter((k) => k.startsWith("limits-seg-")).length, 2);
+});
+
+test("the card width drags, clamps and persists", async () => {
+  const m = machine({ found: ["claude"], node: null, programs: { "get_usage": { stdout: claudeStdout(CLAUDE_USAGE) } } });
+  await m.start();
+  m.render();
+  find(m.tree, "limits-pop").handlers.on_open_change(true, m.cx);
+  await m.settle();
+  m.render();
+  assert.equal(m.mod.cardW, 310);
+  assert.equal(find(m.tree, "limits-card").style.w[0], 310);
+  // Press the left edge and move left 40px.
+  m.winpos.x = 100;
+  m.winpos.y = 200;
+  find(m.tree, "limits-resize-l").handlers.on_mouse_down({}, m.cx);
+  m.winpos.x = 60;
+  m.mod.trackResize(m.cx);
+  assert.equal(m.mod.cardW, 350);
+  assert.equal(m.store.get("cardW"), "350");
+  assert.equal(find(m.render(), "limits-card").style.w[0], 350);
+  // Clamped both ways; release stops tracking.
+  m.winpos.x = -900;
+  m.mod.trackResize(m.cx);
+  assert.equal(m.mod.cardW, 520);
+  m.winpos.x = 900;
+  m.mod.trackResize(m.cx);
+  assert.equal(m.mod.cardW, 240);
+  find(m.tree, "limits-resize-l").handlers.on_mouse_up({}, m.cx);
+  assert.equal(m.mod.resizing, null);
+});
+
+test("the bottom edge drags the list height", async () => {
+  const m = machine({ found: ["claude"], node: null, programs: { "get_usage": { stdout: claudeStdout(CLAUDE_USAGE) } } });
+  await m.start();
+  m.render();
+  find(m.tree, "limits-pop").handlers.on_open_change(true, m.cx);
+  await m.settle();
+  m.render();
+  assert.equal(m.mod.cardH, null);
+  m.winpos.x = 100;
+  m.winpos.y = 300;
+  find(m.tree, "limits-resize-t").handlers.on_mouse_down({}, m.cx);
+  m.winpos.y = 240;
+  m.mod.trackResize(m.cx);
+  assert.equal(m.mod.cardW, 310, "a vertical drag keeps the width");
+  assert.equal(m.mod.cardH, 380);
+  assert.equal(m.store.get("cardH"), "380");
+  find(m.tree, "limits-resize-t").handlers.on_mouse_up({}, m.cx);
+  assert.equal(m.mod.resizing, null);
+});
+
+test("a dead pointer stops the drag instead of breaking the view", async () => {
+  const m = machine({ found: ["claude"], node: null, programs: { "get_usage": { stdout: claudeStdout(CLAUDE_USAGE) } } });
+  await m.start();
+  m.render();
+  find(m.tree, "limits-pop").handlers.on_open_change(true, m.cx);
+  await m.settle();
+  m.render();
+  m.winpos.x = 100;
+  find(m.tree, "limits-resize-l").handlers.on_mouse_down({}, m.cx);
+  assert.ok(m.mod.resizing, "dragging");
+  // The pointer dies mid-drag (a timer without a live host call throws).
+  m.winpos.dead = true;
+  m.mod.trackResize(m.cx);
+  assert.equal(m.mod.resizing, null);
+  assert.ok(find(m.render(), "limits-card"), "the view still renders");
+});
+
+test("order lists only providers with data or saved accounts", async () => {  const m = machine({ found: ["claude", "grok"], node: null,
+    programs: { "get_usage": { stdout: claudeStdout(CLAUDE_USAGE) } },
+    web: () => ({ status: 404 }) });
+  await m.start();
+  m.render();
+  find(m.tree, "limits-pop").handlers.on_open_change(true, m.cx);
+  await m.settle();
+  m.render();
+  find(m.tree, "limits-gear").handlers.on_click({}, m.cx);
+  m.render();
+  const order = plain(ids(find(m.tree, "limits-settings"))).filter((k) => k.startsWith("limits-order-"));
+  assert.deepEqual(order, ["limits-order-claude"]);
+});
+
+test("the gear opens settings and slides back", async () => {
+  const home = `${APP}/data/t3-limits/accounts/claude/work`;
+  const m = machine({ found: ["claude"], node: null, programs: { "get_usage": { stdout: claudeStdout(CLAUDE_USAGE) } },
+    accounts: { claude: { active: null, accounts: [{ id: "work", label: "Work", home }] } } });
+  await m.start();
+  m.render();
+  find(m.tree, "limits-pop").handlers.on_open_change(true, m.cx);
+  await m.settle();
+  m.render();
+  // Both accounts orderable, Default first.
+  assert.deepEqual(plain(m.mod.orderAccounts()).filter((k) => k.startsWith("claude")), ["claude", "claude:work"]);
+  assert.ok(find(m.tree, "limits-order-claude:work"), "the account order row");
+  find(m.tree, "limits-gear").handlers.on_click({}, m.cx);
+  m.render();
+  assert.ok(find(m.tree, "limits-settings"), "settings page");
+  assert.deepEqual(find(m.tree, "limits-slider").style.left, [-310], "slid left to settings");
+  // Adding lives in settings now, not on the quota card.
+  const card = find(m.tree, "limits-section-claude");
+  assert.equal(find(card, "limits-add-claude"), null);
+  assert.ok(find(find(m.tree, "limits-settings"), "limits-set-add-claude"), "add account in settings");
+  // Move Work above Default: settings and later reads follow.
+  m.mod.move("claude:work", -1, m.cx);
+  m.render();
+  const order = plain(ids(find(m.render(), "limits-settings"))).filter((k) => k.startsWith("limits-order-claude"));
+  assert.deepEqual(order, ["limits-order-claude:work", "limits-order-claude"]);
+  find(m.tree, "limits-back").handlers.on_click({}, m.cx);
+  m.render();
+  assert.deepEqual(find(m.tree, "limits-slider").style.left, [0], "back at the quota page");
 });
 
 test("Codex falls back to the newest rollout when the app-server doesn't answer", async () => {
@@ -361,7 +586,7 @@ test("credentials go only to their own host and never into storage or the rows",
   });
   await m.start();
   assert.deepEqual(m.rows(), ["grok", "cursor", "opencode", "antigravity"]);
-  assert.ok(texts(find(m.tree, "limits-antigravity")).includes("40%"));
+  assert.ok(texts(find(m.tree, "limits-antigravity")).includes("60%"), "what's left, not what's used");
   for (const f of m.fetches) {
     const sent = JSON.stringify(f.opts);
     const host = new URL(f.url).host;

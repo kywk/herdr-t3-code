@@ -1,8 +1,9 @@
-// Usage limits for coding-agent subscriptions, as T3 Code reads and shows them: one row per provider that has at
-// least one limit window, its tightest window as a thin bar, the percent used and when that window resets. Hover a
-// row for every window with its exact reset time; click it to read again. In the sidebar (props.node: this block's
-// layout id) a heading folds the rows to one line and the block fits them, hidden when no provider has a window;
-// without props it's a top bar.
+// Usage limits for coding-agent subscriptions, as T3 Code reads and shows them: in the status bar one
+// icon and what's left per provider that has at least one limit window; a click opens an AI-Quota-style
+// card with every provider together, each with its ring of what's left, its plan badge (when the API
+// reports one), its refills time and every window. In the sidebar (props.node: this block's layout id)
+// a heading folds the rows to one line and the block fits them, hidden when no provider has a window.
+// Percents and bars show what's left (100 minus T3's used); opening the card reads again.
 //
 // What each provider reads, after T3's own probes:
 //   Claude Code  `claude -p` asked `get_usage` over stream-json, as T3's SDK probe: the CLI uses its own login.
@@ -16,21 +17,21 @@
 // Credentials stay in the reader that sends them: never stored, shown, logged or shared.
 // Claude and Codex also keep saved accounts (accounts.js), each read with its own home; see the card.
 
-import { View, div, svg, image } from "gpui-kit";
+import { View, div, svg, image, PathBuilder, Background } from "gpui-kit";
 import { v_flex, h_flex, Popover, InputState, Input } from "gpui-base";
 import { exec, readTextFile, watchFolder, home, appHome, theme, props, run, shared, setShared, focused, openOverlay, notify, nextCommand } from "herdr";
 import { accountsDir, validAccount, activeAccount, accountArgv } from "./accounts.js";
 
-// T3's order and colors (usageProviders.ts). Codex's is T3's contrast foreground: the theme's here.
-// Icons are Herdr's shipped ones: `tint` glyphs take the provider color, the rest are full-color pictures.
+// T3's order and colors (usageProviders.ts), except Codex: T3 uses the contrast foreground, but a
+// tinted single color keeps the ring and gradient legible, so Codex gets its own green.
 const PROVIDERS = [
-  { key: "codex", label: "Codex", color: null, icon: "icons/codex.svg" },
-  { key: "claude", label: "Claude Code", color: "#d97757", icon: "icons/claude.svg" },
+  { key: "codex", label: "Codex", color: "#4cc38a", icon: "mods/t3-limits/icons/codex.svg", tint: true },
+  { key: "claude", label: "Claude Code", color: "#d97757", icon: "mods/t3-limits/icons/claude.svg", tint: true },
   // T3's Grok is 72% of the contrast foreground: the theme's muted.
-  { key: "grok", label: "Grok Build", color: "muted", icon: "icons/grok.svg", tint: true },
-  { key: "cursor", label: "Cursor", color: "#8b8b8b", icon: "icons/cursor.svg", tint: true },
-  { key: "opencode", label: "OpenCode", color: "#5b9bbd", icon: "icons/opencode.svg", tint: true },
-  { key: "antigravity", label: "Antigravity", color: "#8c7bd1", icon: "icons/antigravity.svg" },
+  { key: "grok", label: "Grok Build", color: "muted", icon: "mods/t3-limits/icons/grok.svg", tint: true },
+  { key: "cursor", label: "Cursor", color: "#8b8b8b", icon: "mods/t3-limits/icons/cursor.svg", tint: true },
+  { key: "opencode", label: "OpenCode", color: "#5b9bbd", icon: "mods/t3-limits/icons/opencode.svg", tint: true },
+  { key: "antigravity", label: "Antigravity", color: "#8c7bd1", icon: "mods/t3-limits/icons/antigravity.svg", tint: true },
 ];
 const MINUTE = 60000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
 // Read every 5 minutes; a failing provider waits twice as long each time, up to an hour.
@@ -39,6 +40,8 @@ const POLL = 5 * MINUTE, MAX_WAIT = HOUR;
 const CLICK_GAP = 30000;
 // Sidebar heights: heading, a row each, the space under the last.
 const HEAD = 26, ROW = 20, FOOT = 6;
+// The unified card's ring: what's left, 0-100, around the tightest window's remainder.
+const RING = 54;
 const WARN = 75, NEAR = 90;
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -51,6 +54,24 @@ function win(id, label, used, resetsAt, mins) {
 const isoMs = (s) => (typeof s === "string" ? Date.parse(s) : NaN);
 const secMs = (n) => (typeof n === "number" && n > 0 ? n * 1000 : NaN);
 const num = (n) => typeof n === "number" && Number.isFinite(n);
+
+// A plan name fit for a badge: short plain text, else nothing. Providers that don't report one get no badge.
+function planName(s) {
+  if (typeof s !== "string") return null;
+  const t = s.trim().replace(/\s+/g, " ").slice(0, 16);
+  return /^[A-Za-z0-9][A-Za-z0-9 .+-]*$/.test(t) ? t : null;
+}
+const upperPlan = (s) => { const p = planName(s); return p ? p.toUpperCase() : null; };
+// Lighten a #rrggbb toward white for a gradient tail; null when it isn't a hex literal
+// (paint_path only takes #rgb/#rrggbb/#rrggbbaa, never theme names).
+function lightEnd(hex, k = 0.55) {
+  const m = typeof hex === "string" && hex.match(/^#([0-9a-fA-F]{6})$/);
+  if (!m) return null;
+  const mix = (i) => Math.round(parseInt(m[1].slice(i, i + 2), 16) + (255 - parseInt(m[1].slice(i, i + 2), 16)) * k);
+  return `#${[0, 2, 4].map(mix).map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+}
+// Codex reports a planType id; these are the display names. Anything else shows uppercased, never invented.
+const CODEX_PLANS = { free: "FREE", go: "GO", plus: "PLUS", team: "TEAM", business: "BUSINESS", enterprise: "ENTERPRISE", edu: "EDU" };
 
 // Claude's get_usage reply (percent already 0-100), as claudeUsageResponseToLimits. null: no subscription windows.
 function claudeWindows(r) {
@@ -67,6 +88,7 @@ function claudeWindows(r) {
   }
   const spend = claudeSpend(rl);
   if (spend !== null) out.push(win("monthly_spend", "Monthly spend", spend, NaN));
+  out.plan = upperPlan(r.subscription_type);
   return out;
 }
 
@@ -97,7 +119,8 @@ function claudeReply(stdout) {
 }
 
 // A Codex snapshot (app-server camelCase), as codexRateLimitsToWindows: primary/secondary are positions,
-// and without a window length paid plans mean 5h/weekly, Free and Go monthly.
+// and without a window length paid plans mean 5h/weekly, Free and Go monthly. The snapshot's planType
+// rides on the windows for the badge.
 function codexWindows(snap) {
   if (!snap || (snap.limitId && snap.limitId !== "codex")) return [];
   const monthly = snap.planType === "free" || snap.planType === "go", out = [];
@@ -109,6 +132,7 @@ function codexWindows(snap) {
   }
   const ind = snap.individualLimit;
   if (ind && num(ind.remainingPercent)) out.push(win("individual", "Monthly credit limit", 100 - ind.remainingPercent, secMs(ind.resetsAt)));
+  out.plan = CODEX_PLANS[snap.planType] ?? upperPlan(snap.planType);
   return out;
 }
 
@@ -137,6 +161,7 @@ function opencodeWindows(body) {
 }
 
 // Grok's billing body, as grokUsageResponseToLimits: one subscription window for its period.
+// The body's subscriptionTier (when sent) rides on the windows for the badge.
 function grokWindows(body) {
   const period = body?.config?.currentPeriod, type = period?.type?.replace(/^USAGE_PERIOD_TYPE_/, "");
   const label = type === "WEEKLY" ? "Weekly" : type === "MONTHLY" ? "Monthly" : "Subscription";
@@ -144,7 +169,9 @@ function grokWindows(body) {
   // Grok leaves out a zero percent but keeps the whole period.
   // ponytail: Date.parse, not T3's strict ISO check; a malformed period just reads as no window.
   if (used === undefined && label !== "Subscription" && isoMs(period?.start) < isoMs(period?.end)) used = 0;
-  return num(used) ? [win("subscription", label, used, isoMs(period?.end), type === "WEEKLY" ? 10080 : null)] : [];
+  const out = num(used) ? [win("subscription", label, used, isoMs(period?.end), type === "WEEKLY" ? 10080 : null)] : [];
+  out.plan = planName(body?.subscriptionTier ?? body?.subscription_tier);
+  return out;
 }
 
 // Cursor's GetCurrentPeriodUsage body, as cursorUsageResponseToLimits: the plan's pools for this billing cycle.
@@ -229,10 +256,6 @@ function resetsIn(w, now) {
 function exactTime(ms) {
   const d = new Date(ms), pad = (n) => String(n).padStart(2, "0");
   return `${DAYS[d.getDay()]} ${MONTHS[d.getMonth()]} ${d.getDate()}, ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-function ago(ms, now) {
-  const m = Math.floor((now - ms) / MINUTE);
-  return m < 1 ? "just now" : `${duration(now - ms)} ago`;
 }
 
 // --- Readers. Each resolves to windows, null (present, nothing to read), or throws (keep the last good ones).
@@ -439,6 +462,7 @@ async function readGrok() {
 }
 
 // Cursor's file login (the CLI with AGENT_CLI_CREDENTIAL_STORE=file, or Linux). Never the Keychain.
+// The plan name lives on GetPlanInfo under the same login; without it there's just no badge.
 async function readCursor() {
   let token = "";
   for (const f of [`${home()}/.cursor/auth.json`, `${home()}/.config/cursor/auth.json`]) {
@@ -446,13 +470,18 @@ async function readCursor() {
     if (token) break;
   }
   if (!token) return null;
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "connect-protocol-version": "1", "x-cursor-client-type": "cli" };
   const r = await fetch("https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "connect-protocol-version": "1", "x-cursor-client-type": "cli" },
-    body: "{}",
+    method: "POST", headers, body: "{}",
   });
   if (!r.ok) throw new Error(`Cursor answered ${r.status}`);
-  return cursorWindows(await r.json());
+  const out = cursorWindows(await r.json());
+  const p = await fetch("https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo", {
+    method: "POST", headers, body: "{}",
+  }).catch(() => null);
+  const info = p?.ok ? await p.json().catch(() => null) : null;
+  out.plan = planName(info?.planInfo?.planName);
+  return out;
 }
 
 const READERS = { claude: readClaude, codex: readCodex, grok: readGrok, cursor: readCursor, opencode: readOpencode, antigravity: readAntigravity };
@@ -497,16 +526,33 @@ function withoutAccount(store, provider, id) {
 
 export default class Limits extends View {
   init(_props, cx) {
-    // key ("claude", or "claude:<account id>") -> { windows (null or []: nothing), checkedAt, error, failures, nextAt }.
-    // Only windows and times are cached.
+    // key ("claude", or "claude:<account id>") -> { windows (null or []: nothing), plan (the subscription
+    // badge, or null), checkedAt, error, failures, nextAt }.
+    // Only windows, plan and times are cached.
     this.state = {};
     let cache = {};
     try { cache = JSON.parse(localStorage.getItem("cache") ?? "{}") ?? {}; } catch {}
     for (const [key, c] of Object.entries(cache)) {
-      if (READERS[key.split(":")[0]]) this.state[key] = { windows: c.windows ?? null, checkedAt: c.checkedAt ?? null, error: null, failures: 0, nextAt: 0 };
+      if (READERS[key.split(":")[0]]) this.state[key] = { windows: c.windows ?? null, plan: c.plan ?? null, checkedAt: c.checkedAt ?? null, error: null, failures: 0, nextAt: 0 };
     }
     this.present = new Set(Object.keys(this.state).map((k) => k.split(":")[0]));
     this.collapsed = localStorage.getItem("collapsed") === "true";
+    // The unified card's page, the provider display order, and how many providers the status
+    // bar shows. Order and count persist on this machine; the page does not.
+    this.view = "card";
+    const keys = PROVIDERS.map((p) => p.key);
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem("order") ?? "null"); } catch {}
+    const kept = Array.isArray(saved) ? saved.filter((k) => keys.includes(k)) : [];
+    this.order = [...kept, ...keys.filter((k) => !kept.includes(k))];
+    const max = Number(localStorage.getItem("maxItems"));
+    this.maxItems = Number.isInteger(max) && max >= 1 ? max : 99;
+    // The card width, draggable at its corner; the height stays content-driven.
+    const cardW = Number(localStorage.getItem("cardW"));
+    this.cardW = Number.isInteger(cardW) && cardW >= 1 ? Math.max(240, Math.min(520, cardW)) : 310;
+    const cardH = Number(localStorage.getItem("cardH"));
+    this.cardH = Number.isInteger(cardH) && cardH >= 1 ? Math.max(200, Math.min(700, cardH)) : null;
+    this.resizing = null;
     // The open card's provider, the one being given a new account, and the account a confirm will remove.
     this.openKey = null;
     this.adding = null;
@@ -523,6 +569,8 @@ export default class Limits extends View {
     cx.timer.every(POLL, (cx) => this.refresh(cx));
     // The reset times count down by the minute.
     cx.timer.every(MINUTE, (cx) => cx.notify());
+    // Follows the pointer while a corner drag is held; idle otherwise.
+    cx.timer.every(50, (cx) => this.trackResize(cx));
     // The confirm dialog runs t3-limits.remove-<nonce>.
     cx.spawn(async (cx) => {
       for (;;) {
@@ -547,9 +595,11 @@ export default class Limits extends View {
   }
 
   async read({ key, provider, dir }) {
-    const s = (this.state[key] ??= { windows: null, checkedAt: null, error: null, failures: 0, nextAt: 0 });
+    const s = (this.state[key] ??= { windows: null, plan: null, checkedAt: null, error: null, failures: 0, nextAt: 0 });
     try {
       s.windows = await READERS[provider](dir, !this.accounts(provider).length);
+      // The plan rides with a good read and stays with the last good windows through a failure.
+      if (s.windows) s.plan = Array.isArray(s.windows) ? s.windows.plan ?? null : null;
       Object.assign(s, { checkedAt: Date.now(), error: null, failures: 0, nextAt: Date.now() + POLL });
     } catch (e) {
       s.failures++;
@@ -560,7 +610,7 @@ export default class Limits extends View {
 
   save() {
     const cache = {};
-    for (const { key } of this.targets()) if (this.state[key]?.checkedAt) cache[key] = { windows: this.state[key].windows, checkedAt: this.state[key].checkedAt };
+    for (const { key } of this.targets()) if (this.state[key]?.checkedAt) cache[key] = { windows: this.state[key].windows, plan: this.state[key].plan ?? null, checkedAt: this.state[key].checkedAt };
     localStorage.setItem("cache", JSON.stringify(cache));
   }
 
@@ -589,9 +639,116 @@ export default class Limits extends View {
     return order.find((o) => this.state[o.key]?.windows?.length) ?? null;
   }
 
-  // A provider shows only with at least one window to show.
+  // Providers show in the saved order, in the sidebar, the strip and the card alike.
+  // Order is per account ("codex", "claude:work", ...); provider order is first appearance.
+  accountKeys() {
+    const out = [];
+    for (const p of PROVIDERS) {
+      out.push(p.key);
+      for (const a of this.accounts(p.key)) out.push(keyOf(p.key, a.id));
+    }
+    return out;
+  }
+  orderAccounts() {
+    const cur = this.accountKeys();
+    const kept = this.order.filter((k) => cur.includes(k));
+    const out = [...kept];
+    // A new account joins right after its provider's own entries, not at the very end.
+    for (const k of cur.filter((k) => !kept.includes(k))) {
+      const pk = k.split(":")[0];
+      let at = out.length;
+      for (let i = 0; i < out.length; i++) if (out[i].split(":")[0] === pk) at = i + 1;
+      out.splice(at, 0, k);
+    }
+    return out;
+  }
+  providerOrder() {
+    const seen = [];
+    for (const k of this.orderAccounts()) {
+      const p = k.split(":")[0];
+      if (!seen.includes(p)) seen.push(p);
+    }
+    return seen;
+  }
+  // Order rows list only providers with data or saved accounts, never the whole catalogue.
+  orderRows() {
+    const have = new Set(this.rows().map((p) => p.key));
+    const out = [];
+    for (const k of this.orderAccounts()) {
+      const pk = k.split(":")[0];
+      if (!have.has(pk) && !this.accounts(pk).length) continue;
+      if (!out.includes(k)) out.push(k);
+    }
+    return out;
+  }
   rows() {
-    return PROVIDERS.filter((p) => this.present.has(p.key) && this.shown(p));
+    const at = new Map(this.providerOrder().map((k, i) => [k, i]));
+    return PROVIDERS.filter((p) => this.present.has(p.key) && this.shown(p))
+      .sort((a, b) => (at.get(a.key) ?? 99) - (at.get(b.key) ?? 99));
+  }
+
+  // The display order and the strip count, both kept on this machine.
+  saveOrder() {
+    localStorage.setItem("order", JSON.stringify(this.order));
+  }
+  move(key, dir, cx) {
+    const list = this.orderAccounts();
+    const i = list.indexOf(key), j = i + dir;
+    if (i < 0 || j < 0 || j >= list.length) return;
+    [list[i], list[j]] = [list[j], list[i]];
+    this.order = list;
+    this.saveOrder();
+    cx.notify();
+  }
+  setMax(n, cx) {
+    this.maxItems = Math.max(1, Math.min(PROVIDERS.length, n));
+    localStorage.setItem("maxItems", String(this.maxItems));
+    cx.notify();
+  }
+  setCardW(w) {
+    this.cardW = Math.max(240, Math.min(520, Math.round(w)));
+    localStorage.setItem("cardW", String(this.cardW));
+  }
+  setCardH(h) {
+    this.cardH = Math.max(200, Math.min(700, Math.round(h)));
+    localStorage.setItem("cardH", String(this.cardH));
+  }
+  // Corner-drag resizing: a fast timer follows the pointer while held. It stops on release,
+  // after 10s, or after 1.5s without movement, so a missed mouse-up can't stick it.
+  // The pointer's position, or null outside a live host call (a viewless timer tick, ...).
+  mouseXY() {
+    try {
+      const mp = window.mouse_position ? window.mouse_position() : null;
+      return mp && typeof mp.x === "number" && typeof mp.y === "number" ? mp : null;
+    } catch { return null; }
+  }
+  beginResize(cx, axes = "xy") {
+    const mp = this.mouseXY();
+    if (!mp) return;
+    // The drag starts from what the list shows now; without a stored height, opening the
+    // card just follows the provider count, and the first vertical drag pins it.
+    const visible = this.visibleHeight ?? null;
+    this.resizing = { x0: mp.x, y0: mp.y, w0: this.cardW, h0: this.cardH ?? visible ?? 320, axes, seenX: mp.x, seenY: mp.y, at: Date.now() };
+    cx.notify();
+  }
+  trackResize(cx) {
+    if (!this.resizing || !this.open) { this.resizing = null; return; }
+    try {
+      const now = Date.now();
+      const mp = this.mouseXY();
+      if (!mp || now - this.resizing.at > 10000) { this.resizing = null; return; }
+      const r = this.resizing;
+      if (mp.x !== r.seenX || mp.y !== r.seenY) { r.seenX = mp.x; r.seenY = mp.y; r.at = now; }
+      else if (now - r.at > 1500) { this.resizing = null; return; }
+      // The left edge: dragging left (smaller x) grows the card.
+      if (r.axes !== "y") this.setCardW(r.w0 - (mp.x - r.x0));
+      // The top edge: dragging up (smaller y) grows the card.
+      if (r.axes !== "x") this.setCardH(r.h0 - (mp.y - r.y0));
+    } catch { this.resizing = null; return; }
+    cx.notify();
+  }
+  endResize(cx) {
+    if (this.resizing) { this.resizing = null; cx.notify(); }
   }
 
   // The sidebar block is as tall as what it shows, and hidden when nothing has a window.
@@ -606,6 +763,34 @@ export default class Limits extends View {
       run("layout.resize", { id: node, px });
     }
     this.px = px;
+  }
+
+  // The status bar's trigger opens every provider together: a click reads again unless all are fresh
+  // (refresh itself reads only what's due). Same same-press guard as toggle().
+  toggleBar(open, cx) {
+    const now = Date.now();
+    this.resizing = null;
+    if (open) {
+      if (this.shutBar && now - this.shutBar < 400) return;
+      this.open = true;
+      this.adding = null;
+      // Back at the card: a confirm left open or cancelled can't remove anything any more.
+      this.removing = null;
+      this.refresh(cx);
+    } else if (this.open) {
+      this.open = false;
+      this.shutBar = now;
+    }
+    cx.notify();
+  }
+
+  // A manual read: everything is due, then the usual one round.
+  refreshAll(cx) {
+    for (const t of this.targets()) {
+      const s = (this.state[t.key] ??= { windows: null, plan: null, checkedAt: null, error: null, failures: 0, nextAt: 0 });
+      s.nextAt = 0;
+    }
+    this.refresh(cx);
   }
 
   // A press on the open row's trigger closes its card. The card's own outside-press close can land first in that
@@ -693,63 +878,259 @@ export default class Limits extends View {
 
   render(cx) {
     const t = theme(), now = Date.now(), sidebar = Boolean(props()?.node);
-    const tone = (used) => (used >= NEAR ? t.blocked : used >= WARN ? t.ansi3 : null);
+    // What's left, 0-100, of a window; percents and bars show this, and it wears the color.
+    const left = (w) => 100 - usedNow(w, now);
+    const tone = (rem) => (rem <= 100 - NEAR ? t.blocked : rem <= 100 - WARN ? t.ansi3 : null);
     const colorOf = (p) => (p.color === null ? t.foreground : t[p.color] ?? p.color);
     const icon = (p, size) => (p.tint ? svg(p.icon).size(size).text_color(colorOf(p)) : image(p.icon).w(size).h(size)).flex_none();
     const bar = (p, w, h) => {
-      const used = usedNow(w, now);
-      return div().flex_1().min_w(0).h(h).rounded(h).bg(t.border).overflow_hidden()
-        .child(div().h_full().rounded(h).bg(tone(used) ?? colorOf(p)).w(`${Math.round(used)}%`).transition("width", { duration: 300, easing: "ease-out" }));
+      const rem = left(w), base = tone(rem) ?? colorOf(p), tail = lightEnd(base);
+      const track = div().flex_1().min_w(0).h(h).rounded(h).bg(t.border).overflow_hidden();
+      const pct = `${Math.round(rem)}%`;
+      // A painted gradient (angle 90: left to right) when the color is a hex literal.
+      // Guarded: a paint_path this build can't do must not take the view down, so anything
+      // unexpected falls back to the solid fill.
+      let fill = null;
+      if (tail) {
+        try {
+          fill = window.paint_path(
+            PathBuilder.fill().move_to(0, 0).line_to("100%", 0).line_to("100%", "100%").line_to(0, "100%").close().build(),
+            Background.linear_gradient(90, base, tail)
+          ).w(pct).h_full();
+        } catch { fill = null; }
+      }
+      if (!fill) fill = div().h_full().rounded(h).bg(base).w(pct);
+      return track.child(fill.transition("width", { duration: 300, easing: "ease-out" }));
     };
-    const link = (id, text, act) => div().id(id).h(20).px(6).flex().flex_none().items_center().rounded(4).text_size(11).text_color(t.muted)
+    const link = (id, text, act) => div().id(id).h(20).px(5).flex().flex_none().items_center().rounded(4).text_size(10).text_color(t.dim)
       .hover((st) => st.bg(t.hover).text_color(t.foreground)).role("button")
       .on_click((_e, cx) => { cx.stop_propagation(); act(cx); cx.notify(); }).child(text);
+    // The subscription badge: the plan in the provider's color, only when the API reported one.
+    const badge = (p, plan) => div().id(`limits-badge-${p.key}`).flex_none().px(6).py(1).rounded(5).bg(t.raised).text_size(9).text_color(colorOf(p)).child(plan);
+    // When the whole was read, as the card footer.
+    const updated = (ms) => { const d = new Date(ms), pad = (n) => String(n).padStart(2, "0"); return `Updated ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 
     // Every window, with its exact reset.
     const windows = (p, key) => (this.state[key]?.windows ?? []).map((w) => v_flex().gap(3)
       .child(h_flex().gap(8)
         .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(w.label))
-        .child(div().flex_none().text_color(tone(usedNow(w, now)) ?? t.foreground).child(`${Math.round(usedNow(w, now))}%`)))
+        .child(div().flex_none().text_size(11).text_color(tone(left(w)) ?? t.foreground).child(`${Math.round(left(w))}%`)))
       .child(h_flex().child(bar(p, w, 4)))
       .when(w.resetsAt !== null, (el) => el.child(div().text_size(11).text_color(t.dim)
         .child(w.resetsAt <= now ? `Reset ${exactTime(w.resetsAt)}` : `Resets in ${resetsIn(w, now)} · ${exactTime(w.resetsAt)}`))));
 
-    // The card: each account (Claude and Codex) or the provider's windows, then when they were read.
-    const card = (p) => {
-      const multi = Boolean(LOGIN[p.key]), active = activeAccount(shared(STORE), p.key)?.id ?? null;
+    // One provider's accounts (Claude and Codex) or its windows: shared by the sidebar card and the unified card.
+    const providerList = (p) => {
+      const multi = Boolean(LOGIN[p.key]);
       const list = multi ? [{ id: null, label: "Default" }, ...this.accounts(p.key)] : [{ id: null, label: p.label }];
-      const read = Math.max(0, ...list.map((a) => this.state[keyOf(p.key, a.id)]?.checkedAt ?? 0));
-      const failed = list.some((a) => this.state[keyOf(p.key, a.id)]?.error);
-      const status = (a) => {
-        const s = this.state[keyOf(p.key, a.id)];
-        return s?.windows?.length ? null : !s?.checkedAt ? (s?.error ? `Could not read: ${s.error}` : "Reading…")
-          : a.id ? "Not signed in yet: finish the login in its tab." : "No limits to read.";
-      };
-      return v_flex().id(`limits-card-${p.key}`).w(300).p(10).gap(10).rounded(10).bg(t.popover).border_1().border_color(t.border).text_size(12)
-        .on_click((_e, cx) => cx.stop_propagation())
-        .child(h_flex().gap(8).items_center().child(icon(p, 14)).child(div().flex_1().font_medium().text_color(t.foreground).child(p.label)))
+      const at = new Map(this.orderAccounts().map((k, i) => [k, i]));
+      list.sort((a, b) => (at.get(keyOf(p.key, a.id)) ?? 99) - (at.get(keyOf(p.key, b.id)) ?? 99));
+      return { multi, active: activeAccount(shared(STORE), p.key)?.id ?? null, list };
+    };
+    // The plan of the shown account, for the badge.
+    const shownPlan = (p) => this.state[this.shown(p)?.key]?.plan ?? null;
+    // The add-account row, link and launcher note, shared by both card styles.
+    const addRow = (p) => h_flex().h(28).px(8).gap(6).items_center().rounded(6).border_1().border_color(t.input)
+      .child(Input.new(this.label).flex_1().h_full().text_size(12).text_color(t.foreground))
+      .child(link(`limits-add-go-${p.key}`, "Add", (cx) => this.addAccount(p.key, cx)));
+    const addLink = (p) => link(`limits-add-${p.key}`, "+ Add account", () => {
+      this.adding = p.key;
+      this.label.set_value("");
+      this.label.focus();
+    });
+    const launcherNote = div().text_size(9.5).text_color(t.dim).child("The checked account applies to new agents from the New menu. Running agents keep theirs.");
+    const statusOf = (p) => (a) => {
+      const s = this.state[keyOf(p.key, a.id)];
+      return s?.windows?.length ? null : !s?.checkedAt ? (s?.error ? `Could not read: ${s.error}` : "Reading…")
+        : a.id ? "Not signed in yet: finish the login in its tab." : "No limits to read.";
+    };
+    const section = (p) => {
+      const { multi, active, list } = providerList(p), status = statusOf(p), plan = shownPlan(p);
+      return v_flex().id(`limits-section-${p.key}`).gap(6)
+        .child(h_flex().gap(8).items_center().child(icon(p, 14)).child(div().flex_1().font_medium().text_color(t.foreground).child(p.label))
+          .when(plan, (el) => el.child(badge(p, plan))))
         .children(list.map((a) => {
           const key = keyOf(p.key, a.id);
           return v_flex().id(`limits-account-${key}`).gap(6)
             .when(multi, (el) => el.child(h_flex().h(20).gap(6).items_center()
-              .child(this.launcher && a.id === active ? svg("mods/workspace-chrome/check.svg").size(11).flex_none().text_color(t.accent) : div().w(11).flex_none())
+              .child(this.launcher && a.id === active ? svg("mods/workspace-chrome/check.svg").size(10).flex_none().text_color(t.accent) : div().w(10).flex_none())
               .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(a.label))
               .when(this.launcher && a.id !== active, (el) => el.child(link(`limits-use-${key}`, "Use for new agents", () => setShared(STORE, withActive(shared(STORE), p.key, a.id)))))
               .when(Boolean(a.id), (el) => el.child(link(`limits-remove-${key}`, "Remove", () => this.askRemove(p.key, a))))))
             .children(windows(p, key))
-            .when(Boolean(status(a)), (el) => el.child(div().text_size(11).text_color(t.dim).child(status(a))));
+            .when(Boolean(status(a)), (el) => el.child(div().text_size(10).text_color(t.dim).child(status(a))));
         }))
-        .when(multi && this.adding === p.key, (el) => el.child(h_flex().h(28).px(8).gap(6).items_center().rounded(6).border_1().border_color(t.input)
-          .child(Input.new(this.label).flex_1().h_full().text_size(12).text_color(t.foreground))
-          .child(link(`limits-add-go-${p.key}`, "Add", (cx) => this.addAccount(p.key, cx)))))
-        .when(multi && this.adding !== p.key, (el) => el.child(link(`limits-add-${p.key}`, "+ Add account", () => {
-          this.adding = p.key;
-          this.label.set_value("");
-          this.label.focus();
-        })))
-        .when(multi && this.launcher, (el) => el.child(div().text_size(11).text_color(t.dim).child("The checked account applies to new agents from the New menu. Running agents keep theirs.")))
-        .when(read > 0, (el) => el.child(div().text_size(11).text_color(t.dim)
-          .child(`Read ${ago(read, now)}${failed ? " · a read failed, retrying" : ""}`)));
+        .when(multi && this.adding === p.key, (el) => el.child(addRow(p)))
+        .when(multi && this.adding !== p.key, (el) => el.child(addLink(p)))
+        .when(multi && this.launcher, (el) => el.child(launcherNote));
+    };
+    // One window in the unified card: label, short reset and what's left over its bar.
+    // One window: a quiet label, the reset, then the number in the foreground so the eye
+    // lands on percentages; the bar sits under them as a hairline of color.
+    const winrow = (p, w) => v_flex().gap(5)
+      .child(h_flex().gap(8).items_baseline()
+        .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.muted).child(w.label))
+        .child(div().flex_none().text_size(9.5).text_color(t.dim).child(resetsIn(w, now)))
+        .child(div().flex_none().w(32).text_right().text_size(10.5).font_medium().text_color(tone(left(w)) ?? t.foreground).child(`${Math.round(left(w))}%`)))
+      .child(bar(p, w, 5));
+    // One provider as its own card: the ring of what's left beside the name, plan and refills,
+    // then every window of the shown account, then (Claude and Codex) its accounts.
+    const providerCard = (p, showKey) => {
+      const wins = this.state[showKey]?.windows ?? [];
+      const tight = tightest(wins, now), rem = tight ? Math.round(left(tight)) : 0;
+      const refill = tight && resetsIn(tight, now) ? `refills ${resetsIn(tight, now)}` : "";
+      const plan = this.state[showKey]?.plan ?? null;
+      const step = Math.max(0, Math.min(100, Math.round(rem / 5) * 5));
+      const { multi, list } = providerList(p), status = statusOf(p);
+      return v_flex().id(`limits-section-${p.key}`).gap(9).px(13).py(12).rounded(12).bg(t.raised).border_1().border_color(t.border)
+        .on_size_change((size, _cx) => { (this.measured ??= {})[p.key] = size.height; })
+        .child(h_flex().gap(12)
+          .child(div().id(`limits-ring-${p.key}`).relative().w(RING).h(RING).flex_none()
+            .child(svg("mods/t3-limits/icons/rings/track.svg").size(RING).absolute().left(0).top(0).text_color(t.border))
+            .child(svg(`mods/t3-limits/icons/rings/r${String(step).padStart(2, "0")}.svg`).size(RING).absolute().left(0).top(0).text_color(colorOf(p)))
+            .child(div().absolute().left(0).top(0).w(RING).h(RING).flex().items_center().justify_center()
+              .child(div().text_size(13).font_medium().text_color(t.foreground).child(`${rem}%`))))
+          .child(v_flex().flex_1().min_w(0).gap(6)
+            .child(h_flex().gap(6).items_center()
+              .child(div().flex_1().min_w(0).truncate().font_semibold().text_size(12.5).text_color(t.foreground).child(p.label))
+              .when(plan, (el) => el.child(badge(p, plan)))
+              .child(div().flex_none().text_size(9.5).text_color(t.dim).child(refill)))
+            .children(wins.map((w) => winrow(p, w)))))
+        .when(multi, (el) => el.children(list.filter((a) => keyOf(p.key, a.id) !== showKey).map((a) => {
+          const key = keyOf(p.key, a.id);
+          return v_flex().id(`limits-account-${key}`).gap(4)
+            .child(div().text_size(10.5).text_color(t.dim).child(a.label))
+            .children(windows(p, key))
+            .when(Boolean(status(a)), (el) => el.child(div().text_size(10).text_color(t.dim).child(status(a))));
+        })));
+    };
+    const readFooter = (keys) => {
+      const read = Math.max(0, ...keys.map((k) => this.state[k]?.checkedAt ?? 0));
+      const failed = keys.some((k) => this.state[k]?.error);
+      return read > 0 ? [div().text_size(11).text_color(t.dim)
+        .child(`${updated(read)}${failed ? " · a read failed, retrying" : ""}`)] : [];
+    };
+
+    // The sidebar card: one provider's section, then when it was read.
+    const card = (p) => v_flex().id(`limits-card-${p.key}`).w(300).p(10).gap(10).rounded(10).bg(t.popover).border_1().border_color(t.border).text_size(12)
+      .on_click((_e, cx) => cx.stop_propagation())
+      .child(section(p))
+      .children(readFooter(providerList(p).list.map((a) => keyOf(p.key, a.id))));
+
+    // A 24px icon button for the card title rows.
+    const iconBtn = (id, icon, tip, act) => div().id(id).size(22).rounded(6).flex().items_center().justify_center().tooltip(tip)
+      .hover((st) => st.bg(t.hover)).role("button")
+      .on_click((_e, cx) => { cx.stop_propagation(); act(cx); cx.notify(); })
+      .child(svg(icon).size(13).text_color(t.muted));
+    // The status bar's card: the quota page and the settings page side by side in a frame,
+    // sliding left to settings. The provider list is as tall as its estimate, up to a cap,
+    // so many accounts scroll instead of running off the window. Dragged edges are the
+    // two away from the bottom-right anchor: the top grows the list, the left the card.
+    const W = this.cardW, innerW = W;
+    const estCard = (p, showKey) => {
+      const n = (this.state[showKey]?.windows ?? []).length;
+      const { multi, list } = providerList(p);
+      return 24 + Math.max(RING, 22 + n * 34) + (multi ? list.length * 24 + 36 : 0);
+    };
+    const AUTO_H = (rows) => Math.min(520, Math.max(0, rows.reduce((h, p) => h + (this.measured?.[p.key] ?? estCard(p, this.shown(p).key)) + 10, -10)));
+    const listH = this.cardH ?? AUTO_H(this.rows());
+    const unified = (rows) => {
+      const allKeys = rows.flatMap((p) => providerList(p).list.map((a) => keyOf(p.key, a.id)));
+      const read = Math.max(0, ...allKeys.map((k) => this.state[k]?.checkedAt ?? 0));
+      const failed = allKeys.some((k) => this.state[k]?.error);
+      const oRows = this.orderRows();
+      const listed = new Set(oRows.map((k) => k.split(":")[0]));
+      const quotaPage = v_flex().w(innerW).flex_none().gap(12).px(14).pt(12).pb(10)
+        .child(h_flex().gap(6).items_center()
+          .child(div().flex_1().min_w(0).truncate().font_semibold().text_size(13).text_color(t.foreground).child("AI Quota"))
+          .child(div().flex_none().text_size(9.5).text_color(t.dim)
+            .child(read > 0 ? `${updated(read)}${failed ? " · retry" : ""}` : ""))
+          .child(iconBtn("limits-refresh", "mods/t3-limits/icons/refresh.svg", "Read again", (cx) => this.refreshAll(cx)))
+          .child(iconBtn("limits-gear", "mods/workspace-chrome/settings.svg", "Settings", () => { this.view = "settings"; })))
+        .child(v_flex().id("limits-cards").flex_none().h(listH)
+          .overflow_y_scrollbar().gap(10)
+          .on_size_change((size, _cx) => { this.visibleHeight = size.height; })
+          .children(rows.map((p) => providerCard(p, this.shown(p).key))));
+      const sectionTitle = (text) => div().font_semibold().text_size(10).text_color(t.dim).child(text);
+      const hairline = () => div().h(1).bg(t.border).flex_none();
+      const settingsPage = v_flex().id("limits-settings").w(innerW).flex_none().gap(9).px(14).pt(12).pb(10)
+        .child(h_flex().gap(6).items_center()
+          .child(iconBtn("limits-back", "mods/workspace-chrome/chevron-left.svg", "Back", () => { this.view = "card"; }))
+          .child(div().flex_1().font_semibold().text_size(13).text_color(t.foreground).child("Settings")))
+        .child(sectionTitle("Order"))
+        .child(v_flex().gap(1).px(8).py(4).rounded(10).bg(t.raised).border_1().border_color(t.border)
+          .children(oRows.flatMap((k, i) => {
+            const cut = k.indexOf(":"), pk = cut < 0 ? k : k.slice(0, cut);
+            const p = PROVIDERS.find((x) => x.key === pk);
+            const acc = cut < 0 ? null : this.accounts(pk).find((a) => a.id === k.slice(cut + 1));
+            const row = h_flex().id(`limits-order-${k}`).gap(7).items_center().h(30)
+              .child(icon(p, 12))
+              .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.foreground)
+                .child(acc ? `${p.label} · ${acc.label}` : p.label))
+              .child(iconBtn(`limits-up-${k}`, "mods/t3-limits/icons/chevron-up.svg", "Move up", (cx) => this.move(k, -1, cx)))
+              .child(iconBtn(`limits-down-${k}`, "mods/t3-limits/icons/chevron-down.svg", "Move down", (cx) => this.move(k, 1, cx)));
+            return [...(i > 0 ? [hairline()] : []), row];
+          })))
+        .child(sectionTitle("Accounts"))
+        .child(v_flex().gap(6).px(8).py(6).rounded(10).bg(t.raised).border_1().border_color(t.border)
+          .children(["claude", "codex"].filter((pk) => listed.has(pk)).flatMap((pk, pi, arr) => {
+            const p = PROVIDERS.find((x) => x.key === pk);
+            const { active, list } = providerList(p), status = statusOf(p);
+            return [
+              ...(pi > 0 ? [hairline()] : []),
+              h_flex().gap(7).items_center().pt(4).child(icon(p, 12))
+                .child(div().flex_1().font_semibold().text_size(11).text_color(t.foreground).child(p.label)),
+              ...list.map((a) => {
+                const key = keyOf(pk, a.id);
+                return v_flex().id(`limits-set-account-${key}`).gap(2)
+                  .child(h_flex().h(24).gap(7).items_center()
+                    .child(this.launcher && a.id === active ? svg("mods/workspace-chrome/check.svg").size(11).flex_none().text_color(t.accent) : div().w(11).flex_none())
+                    .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.foreground).child(a.label))
+                    .when(this.launcher && a.id !== active, (el) => el.child(link(`limits-set-use-${key}`, "Use", () => setShared(STORE, withActive(shared(STORE), pk, a.id)))))
+                    .when(Boolean(a.id), (el) => el.child(link(`limits-set-remove-${key}`, "Remove", () => this.askRemove(pk, a)))))
+                  .when(Boolean(status(a)), (el) => el.child(div().text_size(11).text_color(t.dim).child(status(a))));
+              }),
+              this.adding === pk
+                ? h_flex().h(28).px(8).gap(6).items_center().rounded(6).border_1().border_color(t.input)
+                  .child(Input.new(this.label).flex_1().h_full().text_size(12).text_color(t.foreground))
+                  .child(link(`limits-set-add-go-${pk}`, "Add", (cx) => this.addAccount(pk, cx)))
+                : h_flex().id(`limits-set-add-${pk}`).h(26).gap(7).items_center().rounded(6).role("button")
+                  .hover((st) => st.bg(t.hover))
+                  .on_click((_e, cx) => { cx.stop_propagation(); this.adding = pk; this.label.set_value(""); this.label.focus(); cx.notify(); })
+                  .child(svg("mods/workspace-chrome/plus.svg").size(11).flex_none().text_color(t.dim))
+                  .child(div().text_size(10.5).text_color(t.muted).child("Add account")),
+              ...(this.launcher && pi === arr.length - 1 ? [launcherNote] : []),
+            ];
+          })))
+        .child(sectionTitle("Status bar"))
+        .child(v_flex().gap(2).p(8).rounded(12).bg(t.raised).border_1().border_color(t.border)
+          .child(h_flex().gap(4).items_center().h(30)
+            .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.muted).child("Show up to"))
+            .child(iconBtn("limits-fewer", "mods/workspace-chrome/minus.svg", "Fewer", (cx) => this.setMax(this.maxItems - 1, cx)))
+            .child(div().w(18).text_center().text_size(11).font_medium().text_color(t.foreground).child(`${Math.min(this.maxItems, listed.size)}`))
+            .child(iconBtn("limits-more", "mods/workspace-chrome/plus.svg", "More", (cx) => this.setMax(this.maxItems + 1, cx)))));
+      // Anchored bottom-right: the dragged edges are the top and the left, as in any panel
+      // that grows away from its anchor. They are overlaid on the edge instead of taking layout
+      // space, so the card stays symmetric.
+      const edge = (id, tip, axes, vert) => div().id(id).absolute().tooltip(tip)
+        .hover((st) => st.bg(t.hover)).role("button")
+        .on_mouse_down("left", (_e, cx) => this.beginResize(cx, axes))
+        .on_mouse_up("left", (_e, cx) => this.endResize(cx))
+        .when(vert, (el) => el.left(0).top(0).bottom(0).w(6)).when(!vert, (el) => el.top(0).left(0).right(0).h(6));
+      return v_flex().id("limits-card").relative().w(W).rounded(14).bg(t.popover).border_1().border_color(t.border).overflow_hidden().text_size(12)
+        .on_click((_e, cx) => cx.stop_propagation())
+        .child(v_flex().w(W).flex_none()
+          .child(h_flex().w(innerW).flex_none().min_w(0)
+            .child(h_flex().id("limits-slider").w(innerW * 2).flex_none().relative().items_start()
+              .left(this.view === "settings" ? -innerW : 0)
+              .transition("left", { duration: 200, easing: "ease-out" })
+              .child(quotaPage).child(settingsPage))))
+        .child(edge("limits-resize-t", "Drag to resize height", "y", false))
+        .child(edge("limits-resize-l", "Drag to resize width", "x", true))
+        .child(div().id("limits-resize-c").absolute().top(0).left(0).size(10).tooltip("Drag to resize")
+          .role("button")
+          .on_mouse_down("left", (_e, cx) => this.beginResize(cx, "xy"))
+          .on_mouse_up("left", (_e, cx) => this.endResize(cx)));
     };
 
     const row = (p) => {
@@ -759,11 +1140,11 @@ export default class Limits extends View {
         .when(sidebar, (el) => el.pl(16).pr(12)).when(!sidebar, (el) => el.w(196).px(4))
         .when(this.openKey === p.key, (el) => el.bg(t.hover))
         .hover((st) => st.bg(t.hover)).role("button")
-        .accessibility_label(`${p.label}${named ? ` (${sh.label})` : ""}: ${Math.round(usedNow(w, now))}% of ${w.label} used`)
+        .accessibility_label(`${p.label}${named ? ` (${sh.label})` : ""}: ${Math.round(left(w))}% left of ${w.label}`)
         .child(icon(p, 12))
         .when(named, (el) => el.child(div().max_w(64).flex_none().truncate().text_size(11).text_color(t.dim).child(sh.label)))
         .child(bar(p, w, 3))
-        .child(div().w(30).flex_none().text_right().text_size(11).text_color(tone(usedNow(w, now)) ?? t.muted).child(`${Math.round(usedNow(w, now))}%`))
+        .child(div().w(30).flex_none().text_right().text_size(11).text_color(tone(left(w)) ?? t.muted).child(`${Math.round(left(w))}%`))
         .child(div().w(40).flex_none().text_right().text_size(11).text_color(t.dim).child(resetsIn(w, now)));
       return Popover.new(`${id}-pop`).anchor("top_left").open(this.openKey === p.key)
         .on_open_change((open, cx) => this.toggle(p.key, open, cx))
@@ -772,8 +1153,25 @@ export default class Limits extends View {
 
     const rows = this.rows();
     if (!rows.length) return div().id("limits");
+
+    // The status bar: one icon and what's left per provider, up to the chosen count in the
+    // saved order; a click opens every provider together.
     if (!sidebar) {
-      return h_flex().id("limits").size_full().px(8).gap(12).items_center().bg(t.chrome).text_size(11).children(rows.map(row));
+      const strip = rows.slice(0, this.maxItems);
+      const seg = (p) => {
+        const w = tightest(this.state[this.shown(p).key].windows, now), rem = Math.round(left(w));
+        return h_flex().id(`limits-seg-${p.key}`).gap(6).items_center().flex_none()
+          .accessibility_label(`${p.label}: ${rem}% left`)
+          .child(icon(p, 13))
+          .child(div().whitespace_nowrap().text_size(10.5).font_medium().text_color(tone(rem) ?? t.foreground).child(`${rem}%`));
+      };
+      const content = h_flex().id("limits-bar").gap(10).items_center().flex_none()
+        .children(strip.flatMap((p, i) => [...(i > 0 ? [div().w(1).h(14).bg(t.border).flex_none()] : []), seg(p)]));
+      return h_flex().id("limits").size_full().px(12).items_center().justify_end().overflow_hidden()
+        .bg(t.chrome).border_t(1).border_color(t.border).text_size(11)
+        .child(Popover.new("limits-pop").anchor("bottom_right").open(this.open)
+          .on_open_change((open, cx) => this.toggleBar(open, cx))
+          .trigger(content).content(unified(rows)));
     }
 
     // Folded: the tightest shown window of all, on the heading.
@@ -792,7 +1190,7 @@ export default class Limits extends View {
         .child(div().flex_1())
         .when(this.collapsed, (el) => el
           .child(icon(top.p, 11))
-          .child(div().text_size(11).text_color(tone(usedNow(top.w, now)) ?? t.muted).child(`${Math.round(usedNow(top.w, now))}%`))
+          .child(div().text_size(11).text_color(tone(left(top.w)) ?? t.muted).child(`${Math.round(left(top.w))}%`))
           .child(div().text_size(11).text_color(t.dim).child(resetsIn(top.w, now))))
         .child(svg(`mods/workspace-chrome/chevron-${this.collapsed ? "right" : "down"}.svg`).size(11).flex_none().text_color(t.dim)))
       .when(!this.collapsed, (el) => el.children(rows.map(row)));
